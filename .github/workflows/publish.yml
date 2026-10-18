@@ -1,0 +1,127 @@
+name: Publish images
+
+# Builds ghcr.io/mai-lib/{mai,mai-r,mai-python} for linux/amd64 and
+# linux/arm64 on native runners, then joins each pair into one multi-arch tag.
+#
+# - Pushes to main, the weekly schedule and manual runs publish.
+# - Pull requests build both arches without publishing.
+#
+# Tags: latest, and mai-<short sha of the mai commit built>.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    - cron: "17 3 * * 1"
+  workflow_dispatch:
+    inputs:
+      mai_ref:
+        description: mai branch, tag or commit
+        default: main
+      rmai_ref:
+        description: rmai branch, tag or commit
+        default: main
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  REGISTRY: ghcr.io/mai-lib
+  PUBLISH: ${{ github.event_name != 'pull_request' }}
+
+jobs:
+  refs:
+    runs-on: ubuntu-latest
+    outputs:
+      mai: ${{ steps.r.outputs.mai }}
+      rmai: ${{ steps.r.outputs.rmai }}
+    steps:
+      # resolve to SHAs so a new upstream commit busts the build cache
+      - id: r
+        run: |
+          resolve() { git ls-remote "https://github.com/mai-lib/$1" "$2" | head -n1 | cut -f1; }
+          mai=$(resolve mai "${{ inputs.mai_ref || 'main' }}")
+          rmai=$(resolve rmai "${{ inputs.rmai_ref || 'main' }}")
+          echo "mai=${mai:-${{ inputs.mai_ref }}}" >> "$GITHUB_OUTPUT"
+          echo "rmai=${rmai:-${{ inputs.rmai_ref }}}" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: refs
+    name: ${{ matrix.target }} ${{ matrix.arch }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [mai, r, python]
+        arch: [amd64, arm64]
+        include:
+          - { arch: amd64, runner: ubuntu-latest }
+          - { arch: arm64, runner: ubuntu-24.04-arm }
+          - { target: mai, image: mai }
+          - { target: r, image: mai-r }
+          - { target: python, image: mai-python }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        if: env.PUBLISH == 'true'
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          target: ${{ matrix.target }}
+          platforms: linux/${{ matrix.arch }}
+          build-args: |
+            MAI_REF=${{ needs.refs.outputs.mai }}
+            RMAI_REF=${{ needs.refs.outputs.rmai }}
+          cache-from: type=gha,scope=${{ matrix.target }}-${{ matrix.arch }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.target }}-${{ matrix.arch }}
+          outputs: ${{ env.PUBLISH == 'true' && format('type=image,name={0}/{1},push-by-digest=true,name-canonical=true,push=true', env.REGISTRY, matrix.image) || 'type=cacheonly' }}
+      - name: Save digest
+        if: env.PUBLISH == 'true'
+        run: |
+          mkdir -p digests
+          touch "digests/${DIGEST#sha256:}"
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+      - uses: actions/upload-artifact@v4
+        if: env.PUBLISH == 'true'
+        with:
+          name: digest-${{ matrix.image }}-${{ matrix.arch }}
+          path: digests/*
+          retention-days: 1
+
+  merge:
+    needs: [refs, build]
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        image: [mai, mai-r, mai-python]
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: digest-${{ matrix.image }}-*
+          merge-multiple: true
+          path: digests
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Create multi-arch tags
+        working-directory: digests
+        run: |
+          name="$REGISTRY/${{ matrix.image }}"
+          short=$(echo "${{ needs.refs.outputs.mai }}" | cut -c1-7)
+          docker buildx imagetools create \
+            -t "$name:latest" -t "$name:mai-$short" \
+            $(printf "$name@sha256:%s " *)
+          docker buildx imagetools inspect "$name:latest"
